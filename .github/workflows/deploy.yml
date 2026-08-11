@@ -1,0 +1,73 @@
+name: Build and deploy backend-service to ECS Fargate (Dev)
+
+# Fires once a reviewer approves the PR — not on merge. Deploys the exact
+# code that was reviewed (the PR's head commit), before it lands on main.
+# Only this repo's own service is touched — the frontend repo has its own
+# workflow and is never deployed by a backend change, and vice versa.
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  id-token: write   # required to assume the AWS role via OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: pgv2-poc-backend-service
+  ECS_CLUSTER: pgv2-poc-cluster
+  ECS_SERVICE: pgv2-poc-backend-service
+
+# A PR can be re-approved (re-review after changes requested); this keeps
+# only the latest approval's deploy running per PR instead of stacking them.
+concurrency:
+  group: dev-deploy-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # No static AWS keys stored in GitHub — the deploy role trusts this
+      # repo via the OIDC provider (token.actions.githubusercontent.com,
+      # already created in the AWS account for the earlier hyventur POC).
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::833179915312:role/pgv2-backend-github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.event.pull_request.head.sha }}
+        run: |
+          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $REGISTRY/$ECR_REPOSITORY:latest
+
+      # The task definition points at the ":latest" tag, so forcing a new
+      # deployment is enough to roll the image just pushed above.
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment \
+            --region $AWS_REGION
+
+      - name: Wait for service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --region $AWS_REGION
