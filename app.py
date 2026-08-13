@@ -37,7 +37,7 @@ def info():
     return jsonify(
         service=SERVICE_NAME,
         hostname=socket.gethostname(),
-        message="hello from backend-service, reached over the private network",
+        message="hello from backend-service, reached over the private network-tested",
         started_at=datetime.datetime.fromtimestamp(START_TIME, tz=datetime.timezone.utc).isoformat(),
         uptime_seconds=round(time.time() - START_TIME, 2),
     )
