@@ -89,7 +89,7 @@ def health():
     return jsonify(status="ok", service=SERVICE_NAME, hostname=socket.gethostname())
 
 
-@app.get("/test-connection")
+@app.get("/Test-connection")
 def test_connection():
     result = check_backend()
     result["called"] = f"{BACKEND_URL}/info"
