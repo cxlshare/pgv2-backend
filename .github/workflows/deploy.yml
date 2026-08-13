@@ -1,12 +1,11 @@
 name: Build and deploy frontend-api to ECS Fargate (Dev)
 
-# Fires only when a PR is actually merged into main — not on every push,
-# not on approval alone, not on a PR that's closed without merging.
-# Only this repo's own service is touched — the backend repo has its own
-# workflow and is never deployed by a frontend change, and vice versa.
+# Fires on anything landing on main — a merged PR, a squash/rebase merge,
+# or a direct push straight to the branch. Only this repo's own service is
+# touched — the backend repo has its own workflow and is never deployed
+# by a frontend change, and vice versa.
 on:
-  pull_request:
-    types: [closed]
+  push:
     branches:
       - main
 
@@ -26,12 +25,9 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
 
       # No static AWS keys stored in GitHub — the deploy role trusts this
       # repo via the OIDC provider (token.actions.githubusercontent.com,
@@ -49,7 +45,7 @@ jobs:
       - name: Build and push image
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          IMAGE_TAG: ${{ github.event.pull_request.merge_commit_sha }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $REGISTRY/$ECR_REPOSITORY:latest .
           docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
