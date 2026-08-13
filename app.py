@@ -1,6 +1,7 @@
 import os
 import socket
 import time
+import datetime
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -36,6 +37,7 @@ def info():
         service=SERVICE_NAME,
         hostname=socket.gethostname(),
         message="hello from backend-service, reached over the private network",
+        started_at=datetime.datetime.fromtimestamp(START_TIME, tz=datetime.timezone.utc).isoformat(),
         uptime_seconds=round(time.time() - START_TIME, 2),
     )
 
