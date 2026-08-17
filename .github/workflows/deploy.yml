@@ -19,6 +19,7 @@ env:
   ECR_REPOSITORY: pgv2-poc-frontend-api
   ECS_CLUSTER: pgv2-poc-cluster
   ECS_SERVICE: pgv2-poc-frontend-api
+  CONTAINER_NAME: frontend-api
 
 concurrency:
   group: dev-deploy-main
@@ -46,28 +47,42 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Tagged with the commit SHA only, no ":latest" — the ECR repo has tag
+      # immutability enabled, so re-pushing a mutable tag on the next deploy
+      # would fail outright. The SHA tag also makes it possible to tell
+      # exactly which commit a running task is on.
       - name: Build and push image
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
-          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $REGISTRY/$ECR_REPOSITORY:latest .
+          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $REGISTRY/$ECR_REPOSITORY:latest
 
-      # The task definition points at the ":latest" tag, so forcing a new
-      # deployment is enough to roll the image just pushed above.
-      - name: Deploy to ECS
+      - name: Download current task definition
         run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
-            --force-new-deployment \
-            --region $AWS_REGION
+          aws ecs describe-task-definition \
+            --task-definition $ECS_SERVICE \
+            --region $AWS_REGION \
+            --query taskDefinition \
+            --output json > task-definition.json
 
-      - name: Wait for service to stabilize
-        run: |
-          aws ecs wait services-stable \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
-            --region $AWS_REGION
+      - name: Render new image into task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.pull_request.merge_commit_sha }}
+
+      # Registers the rendered definition as a new task def revision and
+      # updates the service to it — this is the explicit "deploy" step now
+      # that image tags aren't reused, so there's nothing for
+      # force-new-deployment to pick up implicitly.
+      - name: Deploy new task definition revision to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
