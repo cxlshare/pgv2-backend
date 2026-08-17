@@ -1,1 +1,1 @@
-Test PR approved and on merge CICD **
+Test PR approved on merge CICD **
