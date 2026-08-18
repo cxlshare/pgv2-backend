@@ -1,0 +1,47 @@
+version: 0.2
+phases:
+  build:
+    commands:
+      - IMAGE_TAG="$CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+      - docker build -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+      - docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  post_build:
+    commands:
+      - |
+        STATUS=""
+        for i in $(seq 1 30); do
+          STATUS=$(aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" \
+            --image-id imageTag="$IMAGE_TAG" --region "$AWS_REGION" \
+            --query 'imageScanStatus.status' --output text 2>/dev/null || true)
+          [ "$STATUS" = "COMPLETE" ] && break
+          [ "$STATUS" = "FAILED" ] && { echo "Inspector scan FAILED"; exit 1; }
+          sleep 10
+        done
+        [ "$STATUS" != "COMPLETE" ] && { echo "Scan did not complete in time"; exit 1; }
+
+        get_count() {
+          C=$(aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" \
+            --image-id imageTag="$IMAGE_TAG" --region "$AWS_REGION" \
+            --query "imageScanFindingsSummary.findingSeverityCounts.$1" --output text 2>/dev/null || true)
+          [ -z "$C" ] || [ "$C" = "None" ] && C=0
+          echo "$C"
+        }
+        CRITICAL=$(get_count CRITICAL); HIGH=$(get_count HIGH); MEDIUM=$(get_count MEDIUM); LOW=$(get_count LOW)
+        echo "Inspector findings — C:$CRITICAL H:$HIGH M:$MEDIUM L:$LOW"
+        if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 1 ] || [ "$MEDIUM" -gt 2 ] || [ "$LOW" -gt 3 ]; then
+          echo "Scan gate FAILED — not deploying"; exit 1
+        fi
+
+      - aws ecs describe-task-definition --task-definition "$TASK_DEF_FAMILY" --region "$AWS_REGION" --query taskDefinition > task-def.json
+      - |
+        jq --arg IMG "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" --arg NAME "$CONTAINER_NAME" '
+          .containerDefinitions = (.containerDefinitions | map(if .name == $NAME then .image = $IMG else . end))
+          | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+        ' task-def.json > task-def-new.json && mv task-def-new.json task-def.json
+      - aws ecs register-task-definition --cli-input-json file://task-def.json --region "$AWS_REGION"
+      - aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$TASK_DEF_FAMILY" --region "$AWS_REGION"
+      - aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION"
