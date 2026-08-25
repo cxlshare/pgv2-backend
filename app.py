@@ -5,6 +5,7 @@ import time
 import datetime
 
 import boto3
+import psycopg2
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify
 
@@ -25,6 +26,12 @@ _s3 = boto3.client(
     region_name=AWS_REGION,
     endpoint_url=f"https://s3.{AWS_REGION}.amazonaws.com",
 )
+
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = int(os.environ.get("DB_PORT", 5432))
+DB_NAME = os.environ.get("DB_NAME", "pgv2")
+DB_USER = os.environ.get("DB_USER", "pgv2")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 
 
 @app.get("/health")
@@ -54,6 +61,35 @@ def image():
         return jsonify(success=True, service=SERVICE_NAME, image_url=url, s3_bucket=S3_BUCKET, image_key=IMAGE_KEY)
     except (BotoCoreError, ClientError) as exc:
         return jsonify(success=False, service=SERVICE_NAME, error=str(exc)), 502
+
+
+@app.get("/db-check")
+def db_check():
+    start = time.perf_counter()
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            connect_timeout=3,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        finally:
+            conn.close()
+        return jsonify(
+            success=True,
+            service=SERVICE_NAME,
+            db_host=DB_HOST,
+            db_name=DB_NAME,
+            latency_ms=round((time.perf_counter() - start) * 1000, 2),
+        )
+    except psycopg2.OperationalError as exc:
+        return jsonify(success=False, service=SERVICE_NAME, db_host=DB_HOST, error=str(exc)), 502
 
 
 if __name__ == "__main__":
