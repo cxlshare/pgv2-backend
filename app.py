@@ -5,7 +5,7 @@ import time
 import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 app = Flask(__name__)
 
@@ -52,6 +52,15 @@ def check_backend():
         }
 
 
+def get_notes():
+    try:
+        resp = requests.get(f"{BACKEND_URL}/notes", timeout=3)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        return {"success": False, "error": str(exc)}
+
+
 def get_backend_image():
     """Ask backend-service for its own presigned S3 URL and relay it —
     backend-service has its own AWS credentials and never gets a host
@@ -81,7 +90,20 @@ def index():
         image_key=IMAGE_KEY,
         backend_status=check_backend(),
         backend_image=get_backend_image(),
+        notes=get_notes(),
     )
+
+
+@app.post("/notes")
+def create_note():
+    message = request.form.get("message", "").strip()
+    if message:
+        try:
+            resp = requests.post(f"{BACKEND_URL}/notes", json={"message": message}, timeout=3)
+            resp.raise_for_status()
+        except requests.RequestException:
+            pass
+    return redirect(url_for("index"))
 
 
 @app.get("/health")

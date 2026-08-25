@@ -41,6 +41,27 @@
     <a href="/test-connection">View as JSON</a>
   </section>
 
+  <section class="card {{ 'ok' if notes.success else 'fail' }}">
+    <h2>Notes (Postgres via backend-service)</h2>
+    <form action="/notes" method="post">
+      <input type="text" name="message" placeholder="Write something..." required>
+      <button type="submit">Save to DB</button>
+    </form>
+    {% if notes.success %}
+      {% if notes.notes %}
+        <ul class="notes-list">
+          {% for note in notes.notes %}
+            <li><span class="meta">#{{ note.id }} — {{ note.created_at }}</span><br>{{ note.message }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="meta">No notes yet — add one above.</p>
+      {% endif %}
+    {% else %}
+      <p class="status fail">Could not load notes: {{ notes.error }}</p>
+    {% endif %}
+  </section>
+
   <section class="card">
     <h2>Simulate load</h2>
     <p class="meta">Exercises the endpoint a CPU-based autoscaling policy would target later.</p>
