@@ -1,0 +1,238 @@
+name: Build and deploy pgv2 services to ECS Fargate (Dev)
+
+# Fires only when a PR is actually merged into main — not on every push,
+# not on a PR that's closed without merging. The "changes" job below then
+# decides which service job(s) actually run, based on which subfolder the
+# merge touched.
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+permissions:
+  id-token: write   # required to assume the AWS roles via OIDC
+  contents: read
+
+concurrency:
+  group: dev-deploy-main
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+            frontend:
+              - 'frontend/**'
+
+  deploy-backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-2
+      ECR_REPOSITORY: pgv2-poc-backend-service
+      ECS_CLUSTER: pgv2-poc-cluster
+      ECS_SERVICE: pgv2-poc-backend-service
+      CONTAINER_NAME: backend-service
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      # No static AWS keys stored in GitHub — the deploy role trusts this
+      # repo via the OIDC provider (token.actions.githubusercontent.com).
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::833179915312:role/pgv2-backend-github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tagged with the commit SHA only, no ":latest" — the ECR repo has tag
+      # immutability enabled, so re-pushing a mutable tag on the next deploy
+      # would fail outright. The SHA tag also makes it possible to tell
+      # exactly which commit a running task is on.
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./backend
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # Amazon Inspector scans pushed images asynchronously (enhanced
+      # scanning must already be enabled on the ECR repo), so we poll for
+      # scan completion before reading findings. The job fails — blocking
+      # every step below, including the deploy — if the image doesn't meet
+      # the vulnerability bar.
+      - name: Wait for Inspector scan and enforce severity gate
+        env:
+          IMAGE_TAG: ${{ github.event.pull_request.merge_commit_sha }}
+          MAX_CRITICAL: 0
+          MAX_HIGH: 1
+          MAX_MEDIUM: 2
+          MAX_LOW: 3
+        run: |
+          echo "Waiting for Amazon Inspector scan of $ECR_REPOSITORY:$IMAGE_TAG..."
+          STATUS="PENDING"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ecr describe-image-scan-findings \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-id imageTag="$IMAGE_TAG" \
+              --region "$AWS_REGION" \
+              --query 'imageScanStatus.status' --output text 2>/dev/null || echo "PENDING")
+
+            if [ "$STATUS" = "COMPLETE" ]; then
+              break
+            fi
+            if [ "$STATUS" = "FAILED" ]; then
+              echo "Inspector scan failed for $ECR_REPOSITORY:$IMAGE_TAG"
+              exit 1
+            fi
+
+            echo "Scan status: $STATUS (attempt $i/30) — waiting 10s..."
+            sleep 10
+          done
+
+          if [ "$STATUS" != "COMPLETE" ]; then
+            echo "Timed out waiting for Inspector scan to complete"
+            exit 1
+          fi
+
+          FINDINGS=$(aws ecr describe-image-scan-findings \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-id imageTag="$IMAGE_TAG" \
+            --region "$AWS_REGION" \
+            --query 'imageScanFindings.findingSeverityCounts' --output json)
+
+          CRITICAL=$(echo "$FINDINGS" | jq -r '.CRITICAL // 0')
+          HIGH=$(echo "$FINDINGS" | jq -r '.HIGH // 0')
+          MEDIUM=$(echo "$FINDINGS" | jq -r '.MEDIUM // 0')
+          LOW=$(echo "$FINDINGS" | jq -r '.LOW // 0')
+
+          echo "Findings for $ECR_REPOSITORY:$IMAGE_TAG — CRITICAL=$CRITICAL HIGH=$HIGH MEDIUM=$MEDIUM LOW=$LOW"
+
+          FAIL=0
+          [ "$CRITICAL" -gt "$MAX_CRITICAL" ] && { echo "CRITICAL count $CRITICAL exceeds allowed $MAX_CRITICAL"; FAIL=1; }
+          [ "$HIGH" -gt "$MAX_HIGH" ] && { echo "HIGH count $HIGH exceeds allowed $MAX_HIGH"; FAIL=1; }
+          [ "$MEDIUM" -gt "$MAX_MEDIUM" ] && { echo "MEDIUM count $MEDIUM exceeds allowed $MAX_MEDIUM"; FAIL=1; }
+          [ "$LOW" -gt "$MAX_LOW" ] && { echo "LOW count $LOW exceeds allowed $MAX_LOW"; FAIL=1; }
+
+          if [ "$FAIL" -eq 1 ]; then
+            echo "Vulnerability scan gate failed — blocking deployment"
+            exit 1
+          fi
+
+          echo "Scan gate passed — proceeding to deploy"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition $ECS_SERVICE \
+            --region $AWS_REGION \
+            --query taskDefinition \
+            --output json > task-definition.json
+
+      - name: Render new image into task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.pull_request.merge_commit_sha }}
+
+      # Registers the rendered definition as a new task def revision and
+      # updates the service to it — this is the explicit "deploy" step now
+      # that image tags aren't reused, so there's nothing for
+      # force-new-deployment to pick up implicitly.
+      - name: Deploy new task definition revision to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  deploy-frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-2
+      ECR_REPOSITORY: pgv2-poc-frontend-api
+      ECS_CLUSTER: pgv2-poc-cluster
+      ECS_SERVICE: pgv2-poc-frontend-api
+      CONTAINER_NAME: frontend-api
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      # No static AWS keys stored in GitHub — the deploy role trusts this
+      # repo via the OIDC provider (token.actions.githubusercontent.com).
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::833179915312:role/pgv2-frontend-github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tagged with the commit SHA only, no ":latest" — the ECR repo has tag
+      # immutability enabled, so re-pushing a mutable tag on the next deploy
+      # would fail outright. The SHA tag also makes it possible to tell
+      # exactly which commit a running task is on.
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./frontend
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition $ECS_SERVICE \
+            --region $AWS_REGION \
+            --query taskDefinition \
+            --output json > task-definition.json
+
+      - name: Render new image into task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.pull_request.merge_commit_sha }}
+
+      # Registers the rendered definition as a new task def revision and
+      # updates the service to it — this is the explicit "deploy" step now
+      # that image tags aren't reused, so there's nothing for
+      # force-new-deployment to pick up implicitly.
+      - name: Deploy new task definition revision to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
