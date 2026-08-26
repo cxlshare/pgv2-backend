@@ -1,0 +1,27 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: us-east-2
+    AWS_ACCOUNT_ID: "833179915312"
+    BACKEND_ECR_REPO: pgv2-poc-backend-service
+    FRONTEND_ECR_REPO: pgv2-poc-frontend-api
+
+phases:
+  pre_build:
+    commands:
+      - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:12}
+      - REGISTRY=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+
+  build:
+    commands:
+      # Same build context (repo root) for both — only the Dockerfile differs.
+      - docker build -f Dockerfile.backend -t $REGISTRY/$BACKEND_ECR_REPO:$IMAGE_TAG .
+      - docker build -f Dockerfile         -t $REGISTRY/$FRONTEND_ECR_REPO:$IMAGE_TAG .
+
+  post_build:
+    commands:
+      - docker push $REGISTRY/$BACKEND_ECR_REPO:$IMAGE_TAG
+      - docker push $REGISTRY/$FRONTEND_ECR_REPO:$IMAGE_TAG
+      - echo "Pushed backend and frontend images tagged $IMAGE_TAG"
