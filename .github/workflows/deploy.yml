@@ -1,0 +1,180 @@
+# GitHub Actions equivalent of the proven buildspec.yml (AWS CodeBuild),
+# finalized for the discovery-POC throwaway account (111898801785) using
+# resources already verified to exist there: hyv-discovery-cluster,
+# hyv-discovery-gateway-api(-task/-svc), hyv-discovery-gateway-migrate(-task/-svc),
+# and the gh-oidc-hyv-discovery-deploy-role (trust policy already fixed to
+# environment-based; its permissions policy already extended with
+# ecr:DescribeImages + ecr:DescribeImageScanFindings for the digest/scan
+# steps below, which the original scoped policy didn't have).
+#
+# Ported 1:1 in behavior from the buildspec, with two structural changes:
+#  1. No manual `git clone` with a GITHUB_TOKEN PAT — `actions/checkout`
+#     replaces the whole `install` phase's clone step natively.
+#  2. AWS auth is via OIDC (`configure-aws-credentials` + the role above),
+#     not CodeBuild's implicit service role.
+#
+# Everything else — digest-based Inspector scan polling, severity counts,
+# the (currently non-blocking, matching the buildspec's own commented-out
+# `#return 1`) threshold check, task-def image swap via jq, register +
+# update-service + wait — is a direct port of the buildspec's logic.
+#
+# Before first run: repo Settings -> Environments -> dev -> Environment
+# variables -> add AWS_OIDC_ROLE_ARN = arn:aws:iam::111898801785:role/gh-oidc-hyv-discovery-deploy-role
+
+name: Deploy (CodeBuild-equivalent)
+
+on:
+  push:
+    branches: [ "merge-monorepo-flat" ]
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ECS_CLUSTER: hyv-discovery-cluster
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    strategy:
+      # Mirrors the buildspec's two `deploy_service` calls — thresholds are
+      # inline literals there too (0/1/2/3 backend, 4/8/13/1 frontend), not
+      # sourced from CodeBuild project env vars, so they stay inline here.
+      matrix:
+        include:
+          - name: backend
+            dockerfile: Dockerfile.backend
+            ecr_repo: hyv-discovery-gateway-api
+            ecs_service: hyv-discovery-gateway-api-svc
+            task_def_family: hyv-discovery-gateway-api-task
+            container_name: gateway-api
+            max_critical: 0
+            max_high: 1
+            max_medium: 2
+            max_low: 3
+          - name: frontend
+            dockerfile: Dockerfile
+            ecr_repo: hyv-discovery-gateway-migrate
+            ecs_service: hyv-discovery-gateway-migrate-svc
+            task_def_family: hyv-discovery-gateway-migrate-task
+            container_name: gateway-migrate
+            max_critical: 4
+            max_high: 8
+            max_medium: 13
+            max_low: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        # Buildspec's `install` phase also ran `pip install` + `py_compile`
+        # as a cheap smoke test before building images. Uncomment if you
+        # want that same pre-flight check here (needs a Python setup step
+        # first — left out since it's redundant with the Docker build itself
+        # failing on a real syntax/dependency error anyway).
+        # - run: |
+        #     pip install --no-cache-dir -r requirements-backend.txt
+        #     python -m py_compile app_backend.py
+        #     pip install --no-cache-dir -r requirements.txt
+        #     python -m py_compile app.py
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+
+      - name: Build and push image
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          ECR_REPOSITORY: ${{ matrix.ecr_repo }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -e
+          echo "=== $ECR_REPOSITORY: build (-f $DOCKERFILE) and push ==="
+          docker build -f "$DOCKERFILE" -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Wait for Inspector scan and check severity thresholds
+        env:
+          ECR_REPOSITORY: ${{ matrix.ecr_repo }}
+          IMAGE_TAG: ${{ github.sha }}
+          MAX_CRITICAL: ${{ matrix.max_critical }}
+          MAX_HIGH: ${{ matrix.max_high }}
+          MAX_MEDIUM: ${{ matrix.max_medium }}
+          MAX_LOW: ${{ matrix.max_low }}
+        run: |
+          set -e
+          echo "=== $ECR_REPOSITORY: resolve digest ==="
+          IMAGE_DIGEST=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$IMAGE_TAG" --region "$AWS_REGION" --query 'imageDetails[0].imageDigest' --output text)
+
+          echo "=== $ECR_REPOSITORY: waiting for Inspector scan on $IMAGE_DIGEST ==="
+          SCAN_STATUS="IN_PROGRESS"
+          for i in $(seq 1 30); do
+            SCAN_STATUS=$(aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" --image-id imageDigest="$IMAGE_DIGEST" --region "$AWS_REGION" --no-paginate --query 'imageScanStatus.status' --output text 2>/dev/null | head -n1)
+            [ -z "$SCAN_STATUS" ] && SCAN_STATUS="IN_PROGRESS"
+            echo "  [$i/30] scan status: $SCAN_STATUS"
+            if [ "$SCAN_STATUS" = "ACTIVE" ] || [ "$SCAN_STATUS" = "COMPLETE" ] || [ "$SCAN_STATUS" = "FAILED" ]; then
+              break
+            fi
+            sleep 15
+          done
+
+          if [ "$SCAN_STATUS" != "ACTIVE" ] && [ "$SCAN_STATUS" != "COMPLETE" ]; then
+            echo "Inspector scan did not complete in time (last status: $SCAN_STATUS) — blocking deploy of $ECR_REPOSITORY"
+            exit 1
+          fi
+
+          get_count() {
+            local val
+            val=$(aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" --image-id imageDigest="$IMAGE_DIGEST" --region "$AWS_REGION" --no-paginate --query "imageScanFindings.findingSeverityCounts.$1" --output text 2>/dev/null | head -n1)
+            [ -z "$val" ] || [ "$val" = "None" ] && val=0
+            echo "$val"
+          }
+          CRITICAL=$(get_count CRITICAL)
+          HIGH=$(get_count HIGH)
+          MEDIUM=$(get_count MEDIUM)
+          LOW=$(get_count LOW)
+          echo "$ECR_REPOSITORY findings — CRITICAL=$CRITICAL HIGH=$HIGH MEDIUM=$MEDIUM LOW=$LOW"
+
+          if [ "$CRITICAL" -gt "$MAX_CRITICAL" ] || [ "$HIGH" -gt "$MAX_HIGH" ] || [ "$MEDIUM" -gt "$MAX_MEDIUM" ] || [ "$LOW" -gt "$MAX_LOW" ]; then
+            echo "Scan thresholds exceeded for $ECR_REPOSITORY (allowed: C<=$MAX_CRITICAL H<=$MAX_HIGH M<=$MAX_MEDIUM L<=$MAX_LOW)"
+            # Intentionally not blocking — matches the buildspec's own
+            # commented-out `#return 1` here. This is a logged warning only,
+            # not a gate, exactly as currently proven in CodeBuild. Flip this
+            # to `exit 1` if/when you decide to actually enforce it.
+          fi
+          echo "=== $ECR_REPOSITORY: scan checked — proceeding to deploy ==="
+
+      - name: Register new task definition revision
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ matrix.ecr_repo }}
+          TASK_DEF_FAMILY: ${{ matrix.task_def_family }}
+          CONTAINER_NAME: ${{ matrix.container_name }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -e
+          aws ecs describe-task-definition --task-definition "$TASK_DEF_FAMILY" --region "$AWS_REGION" --query taskDefinition > "task-def.json"
+          jq --arg IMG "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" --arg NAME "$CONTAINER_NAME" '
+            .containerDefinitions = (.containerDefinitions | map(if .name == $NAME then .image = $IMG else . end))
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+          ' "task-def.json" > "task-def-new.json" && mv "task-def-new.json" "task-def.json"
+          aws ecs register-task-definition --cli-input-json "file://task-def.json" --region "$AWS_REGION"
+
+      - name: Update service and wait for stability
+        env:
+          ECS_SERVICE: ${{ matrix.ecs_service }}
+          TASK_DEF_FAMILY: ${{ matrix.task_def_family }}
+        run: |
+          set -e
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$TASK_DEF_FAMILY" --region "$AWS_REGION"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION"
+          echo "=== $ECS_SERVICE: deployed and stable ==="
