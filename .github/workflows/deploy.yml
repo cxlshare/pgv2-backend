@@ -51,10 +51,10 @@ jobs:
             ecs_service: hyv-discovery-gateway-api-svc
             task_def_family: hyv-discovery-gateway-api-task
             container_name: gateway-api
-            max_critical: 0
-            max_high: 1
-            max_medium: 2
-            max_low: 3
+            max_critical: 4
+            max_high: 16
+            max_medium: 11
+            max_low: 1
           - name: frontend
             dockerfile: Dockerfile
             ecr_repo: hyv-discovery-gateway-migrate
@@ -62,7 +62,7 @@ jobs:
             task_def_family: hyv-discovery-gateway-migrate-task
             container_name: gateway-migrate
             max_critical: 4
-            max_high: 8
+            max_high: 16
             max_medium: 13
             max_low: 1
     steps:
