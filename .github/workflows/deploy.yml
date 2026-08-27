@@ -2,10 +2,12 @@
 # finalized for the discovery-POC throwaway account (111898801785) using
 # resources already verified to exist there: hyv-discovery-cluster,
 # hyv-discovery-gateway-api(-task/-svc), hyv-discovery-gateway-migrate(-task/-svc),
-# and the gh-oidc-hyv-discovery-deploy-role (trust policy already fixed to
-# environment-based; its permissions policy already extended with
-# ecr:DescribeImages + ecr:DescribeImageScanFindings for the digest/scan
-# steps below, which the original scoped policy didn't have).
+# and the gh-oidc-hyv-discovery-deploy-role (trust policy fixed to
+# environment-based with the repo's customized numeric-ID subject claim;
+# permissions policy extended with inspector2:ListCoverage/ListFindings
+# for the scan-polling step below — this account uses Inspector enhanced
+# scanning, not classic ECR scan-on-push, so the inspector2 API is what
+# actually has data).
 #
 # Ported 1:1 in behavior from the buildspec, with two structural changes:
 #  1. No manual `git clone` with a GITHUB_TOKEN PAT — `actions/checkout`
@@ -65,6 +67,35 @@ jobs:
             max_high: 16
             max_medium: 13
             max_low: 1
+          # checkout reuses the same backend code/Dockerfile/image as
+          # gateway-api, so it gets identical scan results — thresholds
+          # match. Registered in Cloud Map as "checkout-service" so portal
+          # can reach it.
+          - name: checkout
+            dockerfile: Dockerfile.backend
+            ecr_repo: hyv-discovery-checkout
+            ecs_service: hyv-discovery-checkout-svc
+            task_def_family: hyv-discovery-checkout-task
+            container_name: checkout
+            max_critical: 4
+            max_high: 16
+            max_medium: 11
+            max_low: 1
+          # portal reuses the same frontend code/Dockerfile/image as
+          # gateway-migrate, so it gets identical scan results — thresholds
+          # match. Its task def's BACKEND_URL points at
+          # checkout-service.hyv-discovery.local, not backend-service, so
+          # it calls checkout rather than gateway-api.
+          - name: portal
+            dockerfile: Dockerfile
+            ecr_repo: hyv-discovery-portal
+            ecs_service: hyv-discovery-portal-svc
+            task_def_family: hyv-discovery-portal-task
+            container_name: portal
+            max_critical: 4
+            max_high: 16
+            max_medium: 13
+            max_low: 1
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -112,30 +143,39 @@ jobs:
           MAX_LOW: ${{ matrix.max_low }}
         run: |
           set -e
-          echo "=== $ECR_REPOSITORY: resolve digest ==="
-          IMAGE_DIGEST=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$IMAGE_TAG" --region "$AWS_REGION" --query 'imageDetails[0].imageDigest' --output text)
-
-          echo "=== $ECR_REPOSITORY: waiting for Inspector scan on $IMAGE_DIGEST ==="
-          SCAN_STATUS="IN_PROGRESS"
-          for i in $(seq 1 30); do
-            SCAN_STATUS=$(aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" --image-id imageDigest="$IMAGE_DIGEST" --region "$AWS_REGION" --no-paginate --query 'imageScanStatus.status' --output text 2>/dev/null | head -n1)
-            [ -z "$SCAN_STATUS" ] && SCAN_STATUS="IN_PROGRESS"
-            echo "  [$i/30] scan status: $SCAN_STATUS"
-            if [ "$SCAN_STATUS" = "ACTIVE" ] || [ "$SCAN_STATUS" = "COMPLETE" ] || [ "$SCAN_STATUS" = "FAILED" ]; then
+          # NOTE: this account uses AWS Inspector's enhanced/continuous ECR
+          # scanning (activated account-wide in Runbook Phase 4), not classic
+          # ECR "scan on push". `aws ecr describe-image-scan-findings` only
+          # ever reports on the classic scan and stays empty forever here —
+          # that caused every run to time out waiting on a status that would
+          # never arrive. `aws inspector2 list-coverage`/`list-findings` are
+          # the correct APIs for enhanced scanning and typically resolve in
+          # ~15s for these images (verified directly against this account).
+          echo "=== $ECR_REPOSITORY: waiting for Inspector scan of $IMAGE_TAG ==="
+          SCAN_REASON="PENDING"
+          for i in $(seq 1 20); do
+            SCAN_REASON=$(aws inspector2 list-coverage \
+              --filter-criteria "{\"ecrImageTags\":[{\"comparison\":\"EQUALS\",\"value\":\"$IMAGE_TAG\"}],\"ecrRepositoryName\":[{\"comparison\":\"EQUALS\",\"value\":\"$ECR_REPOSITORY\"}]}" \
+              --region "$AWS_REGION" --query 'coveredResources[0].scanStatus.reason' --output text 2>/dev/null | head -n1)
+            [ -z "$SCAN_REASON" ] || [ "$SCAN_REASON" = "None" ] && SCAN_REASON="PENDING"
+            echo "  [$i/20] scan reason: $SCAN_REASON"
+            if [ "$SCAN_REASON" = "SUCCESSFUL" ]; then
               break
             fi
-            sleep 15
+            sleep 10
           done
 
-          if [ "$SCAN_STATUS" != "ACTIVE" ] && [ "$SCAN_STATUS" != "COMPLETE" ]; then
-            echo "Inspector scan did not complete in time (last status: $SCAN_STATUS) — blocking deploy of $ECR_REPOSITORY"
+          if [ "$SCAN_REASON" != "SUCCESSFUL" ]; then
+            echo "Inspector scan did not complete successfully in time (last reason: $SCAN_REASON) — blocking deploy of $ECR_REPOSITORY"
             exit 1
           fi
 
           get_count() {
-            local val
-            val=$(aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" --image-id imageDigest="$IMAGE_DIGEST" --region "$AWS_REGION" --no-paginate --query "imageScanFindings.findingSeverityCounts.$1" --output text 2>/dev/null | head -n1)
-            [ -z "$val" ] || [ "$val" = "None" ] && val=0
+            local sev="$1" val
+            val=$(aws inspector2 list-findings \
+              --filter-criteria "{\"ecrImageTags\":[{\"comparison\":\"EQUALS\",\"value\":\"$IMAGE_TAG\"}]}" \
+              --region "$AWS_REGION" --query 'findings[].severity' --output text 2>/dev/null | tr '\t' '\n' | grep -c "^${sev}\$" || true)
+            [ -z "$val" ] && val=0
             echo "$val"
           }
           CRITICAL=$(get_count CRITICAL)
