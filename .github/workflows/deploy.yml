@@ -57,15 +57,23 @@ jobs:
             max_high: 16
             max_medium: 11
             max_low: 1
+          # gateway-migrate moved from the frontend Dockerfile to the backend
+          # one (2026-08-27) so the POC's topology matches the real PGv2
+          # target architecture — 3 private backend API services (gateway-api,
+          # checkout, gateway-migrate) behind a shared Aurora/Redis data tier,
+          # with only portal public via the ALB. Its task def (revision 5+)
+          # was pre-wired with DB_HOST/REDIS_HOST/etc ahead of this switch —
+          # this run's image-swap step just drops the new image on top.
+          # Thresholds match backend/checkout since it's now identical code.
           - name: frontend
-            dockerfile: Dockerfile
+            dockerfile: Dockerfile.backend
             ecr_repo: hyv-discovery-gateway-migrate
             ecs_service: hyv-discovery-gateway-migrate-svc
             task_def_family: hyv-discovery-gateway-migrate-task
             container_name: gateway-migrate
             max_critical: 4
             max_high: 16
-            max_medium: 13
+            max_medium: 11
             max_low: 1
           # checkout reuses the same backend code/Dockerfile/image as
           # gateway-api, so it gets identical scan results — thresholds
