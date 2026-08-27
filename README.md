@@ -27,3 +27,5 @@ docker build -f Dockerfile.backend  -t backend-service:local .
 Both use the same build context (repo root, `.`) — only the Dockerfile
 differs. See [buildspec.yml](buildspec.yml) for the AWS CodeBuild version
 that also pushes each image to its own ECR repo.
+
+# Test the github CICD
