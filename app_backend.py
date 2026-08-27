@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import socket
 import time
@@ -6,6 +7,7 @@ import datetime
 
 import boto3
 import psycopg2
+import redis
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify, request
 
@@ -32,6 +34,28 @@ DB_PORT = int(os.environ.get("DB_PORT", 5432))
 DB_NAME = os.environ.get("DB_NAME", "pgv2")
 DB_USER = os.environ.get("DB_USER", "pgv2")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+REDIS_TLS = os.environ.get("REDIS_TLS", "false").lower() == "true"
+NOTES_CACHE_KEY = "notes:list"
+NOTES_CACHE_TTL_SECONDS = 15
+
+_redis_client = None
+
+
+def _get_redis():
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            ssl=REDIS_TLS,
+            socket_connect_timeout=3,
+            socket_timeout=3,
+            decode_responses=True,
+        )
+    return _redis_client
 
 
 @app.get("/health")
@@ -92,6 +116,26 @@ def db_check():
         return jsonify(success=False, service=SERVICE_NAME, db_host=DB_HOST, error=str(exc)), 502
 
 
+@app.get("/cache-check")
+def cache_check():
+    start = time.perf_counter()
+    try:
+        client = _get_redis()
+        client.ping()
+        probe_key = "cache-check:probe"
+        client.set(probe_key, "ok", ex=30)
+        client.get(probe_key)
+        return jsonify(
+            success=True,
+            service=SERVICE_NAME,
+            redis_host=REDIS_HOST,
+            redis_tls=REDIS_TLS,
+            latency_ms=round((time.perf_counter() - start) * 1000, 2),
+        )
+    except redis.RedisError as exc:
+        return jsonify(success=False, service=SERVICE_NAME, redis_host=REDIS_HOST, error=str(exc)), 502
+
+
 def _get_conn():
     conn = psycopg2.connect(
         host=DB_HOST,
@@ -129,6 +173,10 @@ def create_note():
             conn.commit()
         finally:
             conn.close()
+        try:
+            _get_redis().delete(NOTES_CACHE_KEY)
+        except redis.RedisError:
+            pass  # cache is best-effort — a stale/unreachable cache must never block a write
         return jsonify(
             success=True,
             service=SERVICE_NAME,
@@ -141,6 +189,13 @@ def create_note():
 @app.get("/notes")
 def list_notes():
     try:
+        cached = _get_redis().get(NOTES_CACHE_KEY)
+        if cached is not None:
+            return jsonify(success=True, service=SERVICE_NAME, source="cache", notes=json.loads(cached))
+    except redis.RedisError:
+        pass  # cache miss/unreachable falls through to Postgres below
+
+    try:
         conn = _get_conn()
         try:
             with conn.cursor() as cur:
@@ -149,7 +204,11 @@ def list_notes():
         finally:
             conn.close()
         notes = [{"id": r[0], "message": r[1], "created_at": r[2].isoformat()} for r in rows]
-        return jsonify(success=True, service=SERVICE_NAME, notes=notes)
+        try:
+            _get_redis().set(NOTES_CACHE_KEY, json.dumps(notes), ex=NOTES_CACHE_TTL_SECONDS)
+        except redis.RedisError:
+            pass  # cache write failure must never fail the read it's caching
+        return jsonify(success=True, service=SERVICE_NAME, source="db", notes=notes)
     except psycopg2.Error as exc:
         return jsonify(success=False, service=SERVICE_NAME, error=str(exc)), 502
 

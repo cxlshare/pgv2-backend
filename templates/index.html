@@ -41,13 +41,27 @@
     <a href="/test-connection">View as JSON</a>
   </section>
 
+  <section class="card {{ 'ok' if cache_status.success else 'fail' }}">
+    <h2>Cache (Redis via backend-service)</h2>
+    {% if cache_status.success %}
+      <p class="status ok">Connected — {{ cache_status.latency_ms }} ms</p>
+      <pre>{{ cache_status.backend_response }}</pre>
+    {% else %}
+      <p class="status fail">Failed — {{ cache_status.error }}</p>
+    {% endif %}
+    <a href="/">Re-test connection</a>
+    &nbsp;|&nbsp;
+    <a href="/test-cache">View as JSON</a>
+  </section>
+
   <section class="card {{ 'ok' if notes.success else 'fail' }}">
-    <h2>Notes (Postgres via backend-service)</h2>
+    <h2>Notes (Postgres via backend-service, cached in Redis)</h2>
     <form action="/notes" method="post">
       <input type="text" name="message" placeholder="Write something..." required>
       <button type="submit">Save to DB</button>
     </form>
     {% if notes.success %}
+      <p class="meta">Source: {{ notes.source }}</p>
       {% if notes.notes %}
         <ul class="notes-list">
           {% for note in notes.notes %}

@@ -52,6 +52,24 @@ def check_backend():
         }
 
 
+def check_cache():
+    start = time.perf_counter()
+    try:
+        resp = requests.get(f"{BACKEND_URL}/cache-check", timeout=3)
+        resp.raise_for_status()
+        return {
+            "success": True,
+            "latency_ms": round((time.perf_counter() - start) * 1000, 2),
+            "backend_response": resp.json(),
+        }
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "latency_ms": round((time.perf_counter() - start) * 1000, 2),
+            "error": str(exc),
+        }
+
+
 def get_notes():
     try:
         resp = requests.get(f"{BACKEND_URL}/notes", timeout=3)
@@ -90,6 +108,7 @@ def index():
         image_key=IMAGE_KEY,
         backend_status=check_backend(),
         backend_image=get_backend_image(),
+        cache_status=check_cache(),
         notes=get_notes(),
     )
 
@@ -115,6 +134,13 @@ def health():
 def test_connection():
     result = check_backend()
     result["called"] = f"{BACKEND_URL}/info"
+    return jsonify(**result), (200 if result["success"] else 502)
+
+
+@app.get("/test-cache")
+def test_cache():
+    result = check_cache()
+    result["called"] = f"{BACKEND_URL}/cache-check"
     return jsonify(**result), (200 if result["success"] else 502)
 
 
